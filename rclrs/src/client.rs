@@ -1,10 +1,14 @@
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     ffi::{CStr, CString},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, Weak},
 };
 
+use futures::{
+    channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
+    StreamExt,
+};
 use rosidl_runtime_rs::Message;
 
 use crate::{
@@ -412,6 +416,158 @@ where
     }
 }
 
+/// Service client that keeps collecting every response for a single rmw request sequence.
+pub type CollectingClient<T> = Arc<CollectingClientState<T>>;
+
+/// The inner state of a [`CollectingClient`].
+pub struct CollectingClientState<T>
+where
+    T: rosidl_runtime_rs::Service,
+{
+    handle: Arc<ClientHandle>,
+    board: Arc<Mutex<CollectingClientRequestBoard<T>>>,
+    #[allow(unused)]
+    lifecycle: WaitableLifecycle,
+}
+
+impl<T> CollectingClientState<T>
+where
+    T: rosidl_runtime_rs::Service,
+{
+    /// Send one request and receive all responses that share the returned rmw sequence.
+    pub fn call_collecting<'a, Req>(
+        &self,
+        request: Req,
+    ) -> Result<CollectingResponse<T>, RclrsError>
+    where
+        Req: MessageCow<'a, T::Request>,
+    {
+        let rmw_message = T::Request::into_rmw_message(request.into_cow());
+        let mut sequence_number = -1;
+        unsafe {
+            // SAFETY: The client handle ensures the rcl_client is valid and the
+            // generic service type supplies the matching request RMW type.
+            rcl_send_request(
+                &*self.handle.lock() as *const _,
+                rmw_message.as_ref() as *const <T::Request as Message>::RmwMsg as *mut _,
+                &mut sequence_number,
+            )
+        }
+        .ok()?;
+
+        let (sender, receiver) = unbounded();
+        self.board
+            .lock()
+            .map_err(|_| RclrsError::PoisonedMutex)?
+            .new_collector(sequence_number, sender);
+
+        Ok(CollectingResponse {
+            sequence_number,
+            receiver,
+            board: Arc::downgrade(&self.board),
+        })
+    }
+
+    pub(crate) fn create<'a>(
+        options: impl Into<ClientOptions<'a>>,
+        node: &Node,
+    ) -> Result<Arc<Self>, RclrsError>
+    where
+        T: rosidl_runtime_rs::Service,
+    {
+        let ClientOptions { service_name, qos } = options.into();
+        let mut rcl_client = unsafe { rcl_get_zero_initialized_client() };
+        let type_support = <T as rosidl_runtime_rs::Service>::get_type_support()
+            as *const rosidl_service_type_support_t;
+        let topic_c_string =
+            CString::new(service_name).map_err(|err| RclrsError::StringContainsNul {
+                err,
+                s: service_name.into(),
+            })?;
+
+        let mut client_options = unsafe { rcl_client_get_default_options() };
+        client_options.qos = qos.into();
+
+        {
+            let rcl_node = node.handle().rcl_node.lock().unwrap();
+            let _lifecycle_lock = ENTITY_LIFECYCLE_MUTEX.lock().unwrap();
+
+            unsafe {
+                rcl_client_init(
+                    &mut rcl_client,
+                    &*rcl_node,
+                    type_support,
+                    topic_c_string.as_ptr(),
+                    &client_options,
+                )
+                .ok()?;
+            }
+        }
+
+        let commands = node.commands().async_worker_commands();
+        let handle = Arc::new(ClientHandle {
+            rcl_client: Mutex::new(rcl_client),
+            node: Arc::clone(node),
+        });
+        let board = Arc::new(Mutex::new(CollectingClientRequestBoard::new()));
+        let (waitable, lifecycle) = Waitable::new(
+            Box::new(CollectingClientExecutable {
+                handle: Arc::clone(&handle),
+                board: Arc::clone(&board),
+            }),
+            Some(Arc::clone(&commands.get_guard_condition())),
+        );
+        commands.add_to_wait_set(waitable);
+
+        Ok(Arc::new(Self {
+            handle,
+            board,
+            lifecycle,
+        }))
+    }
+}
+
+/// Stream-like receiver for responses that share one rmw request sequence.
+pub struct CollectingResponse<T>
+where
+    T: rosidl_runtime_rs::Service,
+{
+    sequence_number: SequenceNumber,
+    receiver: UnboundedReceiver<(T::Response, rmw_service_info_t)>,
+    board: Weak<Mutex<CollectingClientRequestBoard<T>>>,
+}
+
+impl<T> CollectingResponse<T>
+where
+    T: rosidl_runtime_rs::Service,
+{
+    /// Get the rmw sequence number assigned to this request.
+    pub fn sequence_number(&self) -> SequenceNumber {
+        self.sequence_number
+    }
+
+    /// Receive the next response that matches this request sequence.
+    pub async fn recv(&mut self) -> Option<(T::Response, ServiceInfo)> {
+        self.receiver
+            .next()
+            .await
+            .map(|(response, info)| (response, ServiceInfo::from_rmw_service_info(&info)))
+    }
+}
+
+impl<T> Drop for CollectingResponse<T>
+where
+    T: rosidl_runtime_rs::Service,
+{
+    fn drop(&mut self) {
+        if let Some(board) = self.board.upgrade() {
+            if let Ok(mut board) = board.lock() {
+                board.cancel(self.sequence_number);
+            }
+        }
+    }
+}
+
 /// `ClientOptions` are used by [`Node::create_client`][1] to initialize a
 /// [`Client`] for a service.
 ///
@@ -471,6 +627,32 @@ where
 }
 
 type SequenceNumber = i64;
+
+struct CollectingClientExecutable<T>
+where
+    T: rosidl_runtime_rs::Service,
+{
+    handle: Arc<ClientHandle>,
+    board: Arc<Mutex<CollectingClientRequestBoard<T>>>,
+}
+
+impl<T> RclPrimitive for CollectingClientExecutable<T>
+where
+    T: rosidl_runtime_rs::Service,
+{
+    unsafe fn execute(&mut self, ready: ReadyKind, _: &mut dyn Any) -> Result<(), RclrsError> {
+        ready.for_basic()?;
+        self.board.lock().unwrap().execute(&self.handle)
+    }
+
+    fn handle(&self) -> RclPrimitiveHandle<'_> {
+        RclPrimitiveHandle::Client(self.handle.lock())
+    }
+
+    fn kind(&self) -> RclPrimitiveKind {
+        RclPrimitiveKind::Client
+    }
+}
 
 /// This is used internally to monitor the state of active requests, as well as
 /// responses that have arrived without a known request.
@@ -555,6 +737,122 @@ where
         let handle = &*handle.lock();
         unsafe {
             // SAFETY: The three pointers are all kept valid by the handle
+            rcl_take_response_with_info(
+                handle,
+                &mut service_info_out,
+                &mut response_out as *mut <T::Response as Message>::RmwMsg as *mut _,
+            )
+        }
+        .ok()
+        .map(|_| {
+            (
+                T::Response::from_rmw_message(response_out),
+                service_info_out,
+            )
+        })
+    }
+}
+
+struct CollectingClientRequestBoard<T>
+where
+    T: rosidl_runtime_rs::Service,
+{
+    active_collectors: HashMap<SequenceNumber, UnboundedSender<(T::Response, rmw_service_info_t)>>,
+    loose_responses: HashMap<SequenceNumber, Vec<(T::Response, rmw_service_info_t)>>,
+    closed_sequences: HashSet<SequenceNumber>,
+    closed_sequence_order: VecDeque<SequenceNumber>,
+}
+
+impl<T> CollectingClientRequestBoard<T>
+where
+    T: rosidl_runtime_rs::Service,
+{
+    fn new() -> Self {
+        Self {
+            active_collectors: Default::default(),
+            loose_responses: Default::default(),
+            closed_sequences: Default::default(),
+            closed_sequence_order: Default::default(),
+        }
+    }
+
+    fn new_collector(
+        &mut self,
+        sequence_number: SequenceNumber,
+        sender: UnboundedSender<(T::Response, rmw_service_info_t)>,
+    ) {
+        self.closed_sequences.remove(&sequence_number);
+        if let Some(responses) = self.loose_responses.remove(&sequence_number) {
+            for item in responses {
+                if sender.unbounded_send(item).is_err() {
+                    return;
+                }
+            }
+        }
+        self.active_collectors.insert(sequence_number, sender);
+    }
+
+    fn cancel(&mut self, sequence_number: SequenceNumber) {
+        self.active_collectors.remove(&sequence_number);
+        self.loose_responses.remove(&sequence_number);
+        self.remember_closed(sequence_number);
+    }
+
+    fn remember_closed(&mut self, sequence_number: SequenceNumber) {
+        if self.closed_sequences.insert(sequence_number) {
+            self.closed_sequence_order.push_back(sequence_number);
+        }
+        const MAX_CLOSED_SEQUENCES: usize = 4096;
+        while self.closed_sequence_order.len() > MAX_CLOSED_SEQUENCES {
+            if let Some(oldest) = self.closed_sequence_order.pop_front() {
+                self.closed_sequences.remove(&oldest);
+            }
+        }
+    }
+
+    fn execute(&mut self, handle: &Arc<ClientHandle>) -> Result<(), RclrsError> {
+        match self.take_response(handle) {
+            Ok((response, info)) => {
+                let seq = info.request_id.sequence_number;
+                if let Some(sender) = self.active_collectors.get(&seq) {
+                    if sender.unbounded_send((response, info)).is_err() {
+                        self.active_collectors.remove(&seq);
+                        self.remember_closed(seq);
+                    }
+                } else if self.closed_sequences.contains(&seq) {
+                    // The caller finished collecting and dropped the receiver.
+                    // Late responses for that sequence are intentionally ignored.
+                } else {
+                    self.loose_responses
+                        .entry(seq)
+                        .or_default()
+                        .push((response, info));
+                }
+            }
+            Err(err) => match err {
+                RclrsError::RclError {
+                    code: RclReturnCode::ClientTakeFailed,
+                    ..
+                } => {}
+                err => {
+                    log_fatal!(
+                        "rclrs.collecting_client.execute",
+                        "Error while taking a response for a collecting client: {err}",
+                    );
+                }
+            },
+        }
+        Ok(())
+    }
+
+    fn take_response(
+        &self,
+        handle: &Arc<ClientHandle>,
+    ) -> Result<(T::Response, rmw_service_info_t), RclrsError> {
+        let mut service_info_out = ServiceInfo::zero_initialized_rmw();
+        let mut response_out = <T::Response as Message>::RmwMsg::default();
+        let handle = &*handle.lock();
+        unsafe {
             rcl_take_response_with_info(
                 handle,
                 &mut service_info_out,
