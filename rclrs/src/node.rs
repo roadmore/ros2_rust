@@ -38,15 +38,15 @@ use crate::{
     },
     rcl_bindings::*,
     ActionClient, ActionClientState, ActionGoalReceiver, ActionServer, ActionServerState,
-    AnyTimerCallback, Client, ClientOptions, ClientState, Clock, ContextHandle, ExecutorCommands,
-    IntoActionClientOptions, IntoActionServerOptions, IntoAsyncServiceCallback,
-    IntoAsyncSubscriptionCallback, IntoNodeServiceCallback, IntoNodeSubscriptionCallback,
-    IntoNodeTimerOneshotCallback, IntoNodeTimerRepeatingCallback, IntoTimerOptions, LogParams,
-    Logger, MessageInfo, ParameterBuilder, ParameterInterface, ParameterVariant, Parameters,
-    Promise, Publisher, PublisherOptions, PublisherState, RclrsError, RequestedGoal, Service,
-    ServiceOptions, ServiceState, Subscription, SubscriptionOptions, SubscriptionState,
-    TerminatedGoal, TimeSource, Timer, TimerState, ToLogParams, Worker, WorkerOptions, WorkerState,
-    ENTITY_LIFECYCLE_MUTEX,
+    AnyTimerCallback, Client, ClientOptions, ClientState, Clock, CollectingClient,
+    CollectingClientState, ContextHandle, ExecutorCommands, IntoActionClientOptions,
+    IntoActionServerOptions, IntoAsyncServiceCallback, IntoAsyncSubscriptionCallback,
+    IntoNodeServiceCallback, IntoNodeSubscriptionCallback, IntoNodeTimerOneshotCallback,
+    IntoNodeTimerRepeatingCallback, IntoTimerOptions, LogParams, Logger, MessageInfo,
+    ParameterBuilder, ParameterInterface, ParameterVariant, Parameters, Promise, Publisher,
+    PublisherOptions, PublisherState, RclrsError, RequestedGoal, Service, ServiceOptions,
+    ServiceState, Subscription, SubscriptionOptions, SubscriptionState, TerminatedGoal, TimeSource,
+    Timer, TimerState, ToLogParams, Worker, WorkerOptions, WorkerState, ENTITY_LIFECYCLE_MUTEX,
 };
 
 /// A processing unit that can communicate with other nodes. See the API of
@@ -384,6 +384,18 @@ impl NodeState {
     {
         ClientState::<T>::create(options, self)
     }
+
+    /// Creates a service client that can collect multiple responses for one request.
+    pub fn create_collecting_client<'a, T>(
+        self: &Arc<Self>,
+        options: impl Into<ClientOptions<'a>>,
+    ) -> Result<CollectingClient<T>, RclrsError>
+    where
+        T: rosidl_runtime_rs::Service,
+    {
+        CollectingClientState::<T>::create(options, self)
+    }
+
     /// Creates an [`ActionClient`][1].
     ///
     /// [1]: crate::ActionClient
